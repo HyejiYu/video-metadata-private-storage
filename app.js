@@ -1,10 +1,11 @@
-// app.js
-const http = require("http");
-const createServer = http.createServer((req, res) => {
-	res.writeHead(200, { "Content-Type": "text/html" });
-	res.end("Hello World!");
-});
+const express = require("express");
+const app = express();
+const port = 3000;
 
-createServer.listen(3000, () => {
-	console.log("Server Started!");
-});
+app.get("/", (req, res) => {
+	res.send("Hello, This is a Web Server made by Node.js!!!");
+})
+
+app.listen(port, () => {
+	console.log(`Server is running in the "http://localhost:${port}`);
+})

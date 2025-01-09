@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: elasticsearch-custom
+    container_name: elasticsearch
+    #environment:
+    #  - discovery.type=single-node # 단일 노드 모드 설정
+    #  - bootstrap.memory_lock=true # 메모리 잠금 설정
+    #  - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # JVM 메모리 설정 (필요에 따라 조정)
+    #  - xpack.security.enabled=true
+    ports:
+      - "9200:9200" # Elasticsearch REST API 포트 매핑
+      - "9300:9300" # Elasticsearch 노드 간 통신 포트 매핑
+    volumes:
+      - es_data:/usr/share/elasticsearch/data # 데이터 지속성을 위한 볼륨 설정
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    restart: unless-stopped
+  kibana:
+    image: kibana-custom
+    container_name: kibana
+    ports:
+      - "5601:5601" # Kibana 포트 매핑
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+
+
+volumes:
+  es_data:
+    driver: local
+
