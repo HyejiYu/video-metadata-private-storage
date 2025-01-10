@@ -438,8 +438,9 @@ def get_youtube_video_stats(video_url):
 ################################################################################
 
 # MP4 파일 스트리밍 요청
-@app.route("/video/<doc_id>", methods=["GET"])
-def get_video(doc_id):
+@app.route("/video", methods=["GET"])
+def get_video():
+    doc_id = request.args.get("doc_id")
     video_msg = get_VIDEO_document(doc_id)
     script_msg = get_VIDEO_SCRIPT_document(doc_id)
     # 조회수 올리기
@@ -651,9 +652,105 @@ def upload_youtube():
         except Exception as e:
             logger.warning(f"Failed to clean up temporary files: {e}")
 
-@app.route('/search/<word>', methods='GET')
-def search(word):
+def match_VIDEO_keywords(word):
+    body = {
+        "query": {
+            "multi_match": {
+                "query": word,
+                "fields": ["title^3", "description", "category", "keywords^2"],
+                "type": "best_fields",
+                "fuzziness": "AUTO",
+                "minimum_should_match": "1"
+            }
+        },
+        "size": 10
+    }
+    try:
+        response = es.search(index=VIDEO_INDEX, body=body)
+        results = [
+            {
+                "id": hit["_id"],
+                "score": hit["_score"],
+                # "source": hit["_source"]
+            }
+            for hit in response['hits']['hits']
+        ]
+        return results
+    except Exception as e:
+        return []
+
+
+def match_VIDEO_SCRIPT_keywords(word):
+    body = {
+        "query": {
+            "nested": {
+                "path": "scripts",
+                "query": {
+                    "match": {
+                        "scripts.text": {
+                            "query": word,
+                            "fuzziness": "AUTO"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try:
+        response = es.search(index=VIDEO_SCRIPT_INDEX, body=body)
+        results = [
+            {
+                "id": hit["_id"],
+                "score": hit["_score"],
+                # "source": hit["_source"]
+            }
+            for hit in response['hits']['hits']
+        ]
+        # print(f"word: {word}, results: {results}")
+        return results
+    except Exception as e:
+        return []
+
+@app.route('/search', methods=['GET'])
+def search():
+    """ 
+        curl -X GET "http://localhost:3000/search?query=news%20forest"  
+    """
+    query = request.args.get('query')
+    words = query.split(" ")
     
+    all_results = []
+    for word in words:
+        video_res = match_VIDEO_keywords(word)
+        video_script_res = match_VIDEO_SCRIPT_keywords(word)
+        
+        # if not video_res and not video_script_res:
+        #     return jsonify({ "message": "No results found" }), 404
+        all_results += ( video_res + video_script_res )
+        # print(f"word: {word}\n  video_res: {video_res}\n  video_script_res: {video_script_res}")
+        
+    if not all_results:
+        return jsonify({ "message": "No results found" }), 404
+    
+    unique_results = {result['id']: result for result in all_results}.values()
+    print(unique_results)
+    
+    info_result = []
+    for single_res in unique_results:
+        msg = get_VIDEO_document(single_res['id'])
+        info_result += [
+            {
+                "id": single_res['id'],
+                "title": msg['title'],
+                "description": msg['description'],
+                "created_at": msg['created_at'],
+                "views": msg['views'],
+                "likes": msg['likes']
+            }
+        ]
+    
+    return jsonify(info_result), 200
+        
 
 # 서버 실행
 if __name__ == "__main__":
