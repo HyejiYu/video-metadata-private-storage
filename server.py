@@ -390,13 +390,21 @@ def upload_video_elastic_save(data, scripts):
     else:
         return jsonify({"error": str(msg)}), 500
 
-def get_document(doc_id):
+def get_VIDEO_document(doc_id):
     try:
         res = es.get(index=VIDEO_INDEX, id=doc_id)
         return res["_source"]
     except exceptions.NotFoundError:
         return 404 # Document not found
-    
+
+def get_VIDEO_SCRIPT_document(doc_id):
+    try:
+        res = es.get(index=VIDEO_SCRIPT_INDEX, id=doc_id)
+        return res["_source"]
+    except exceptions.NotFoundError:
+        return 404 # Document not found
+
+
 def get_youtube_video_stats(video_url):
     # Extract the video ID from the URL
     if "v=" in video_url:
@@ -426,31 +434,52 @@ def get_youtube_video_stats(video_url):
     else:
         raise ValueError("Video not found or inaccessible")
 
+
 ################################################################################
 
 # MP4 파일 스트리밍 요청
 @app.route("/video/<doc_id>", methods=["GET"])
 def get_video(doc_id):
-    msg = get_document(doc_id)
+    video_msg = get_VIDEO_document(doc_id)
+    script_msg = get_VIDEO_SCRIPT_document(doc_id)
     # 조회수 올리기
-    inc_view_res = increase_view(doc_id)
-    if msg == 404:
+    if video_msg == 404:
         return jsonify({"error": "Document not found"})
-    elif isinstance(msg, dict) and msg:
+    elif isinstance(video_msg, dict) and video_msg:
+        inc_view_res = increase_view(doc_id)
         # youtube 영상이 아니면 S3 객체에 대해 presigned url 생성해서 리턴
-        if (not msg['is_youtube']):
+        if (not video_msg['is_youtube']):
             try:
                 url = s3_client.generate_presigned_url(
                     "get_object",
-                    Params={"Bucket": S3_BUCKET_NAME, "Key": msg['video_url']},
+                    Params={"Bucket": S3_BUCKET_NAME, "Key": video_msg['video_url']},
                     ExpiresIn=3600,
                 )
-                return jsonify({"presignedUrl": url}), 200
+                return jsonify(
+                    {
+                        "is_youtube": 0,
+                        "title": video_msg['title'],
+                        "description": video_msg['description'],
+                        "created_at": video_msg['created_at'],
+                        "views": video_msg['views'],
+                        "likes": video_msg['likes'],
+                        "presignedUrl": url,
+                        "scripts": script_msg['scripts']
+                    }), 200
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
         # youtube 영상이면 클라이언트 쪽에서 Youtube API 사용하도록
         else:
-            return jsonify({"youtube": "it's youtube url"}), 200
+            return jsonify(
+                {
+                    "is_youtube": 1,
+                    "title": video_msg['title'],
+                    "description": video_msg['description'],
+                    "created_at": video_msg['created_at'],
+                    "views": video_msg['views'],
+                    "likes": video_msg['likes'],
+                    "scripts": script_msg['scripts']
+                }), 200
     return jsonify({ "error": "Unexpected document format"}), 500
     
 # 직접 업로드 처리
@@ -621,6 +650,10 @@ def upload_youtube():
                 os.remove(wav_path)
         except Exception as e:
             logger.warning(f"Failed to clean up temporary files: {e}")
+
+@app.route('/search/<word>', methods='GET')
+def search(word):
+    
 
 # 서버 실행
 if __name__ == "__main__":
