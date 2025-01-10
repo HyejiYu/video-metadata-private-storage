@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-import os, io, json, logging
+import os, io, json, logging, re
 import boto3
 import subprocess
 import yt_dlp
@@ -11,6 +11,8 @@ from pydub import AudioSegment
 from datetime import timedelta, datetime
 from elasticsearch import Elasticsearch, exceptions
 from dotenv import load_dotenv
+from googleapiclient.discovery import build
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,8 +33,9 @@ VIDEO_INDEX = os.getenv("VIDEO_INDEX")
 VIDEO_SCRIPT_INDEX = os.getenv("VIDEO_SCRIPT_INDEX")
 ELASTIC_USER=os.getenv("ELASTIC_USER")
 ELASTIC_PASSWORD=os.getenv("ELASTIC_PASSWORD")
-
-es_id = 28 ######################## 이거 서버 키고 끌 때마다 바꿔줘야 함 #######
+API_KEY = os.getenv("YOUTUBE_API_KEY")
+YOUTUBE_API_SERVICE_NAME = 'youtube'
+YOUTUBE_API_VERSION = 'v3'
 
 # Flask 앱 설정
 app = Flask(__name__)
@@ -42,9 +45,9 @@ app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024
 # ElasticSearch
 es = Elasticsearch(
     hosts=["http://localhost:9200"],
-    http_auth = (ELASTIC_USER, ELASTIC_PASSWORD)
+    basic_auth = (ELASTIC_USER, ELASTIC_PASSWORD)
 )
-
+    
 
 # AWS S3 설정
 s3_client = boto3.client(
@@ -55,12 +58,32 @@ s3_client = boto3.client(
 )
 
 # Google Cloud Speech-to-Text 클라이언트 초기화
-speech_client = speech.SpeechClient(client_options={"api_endpoint": "fsp-project-447210"})
+speech_client = speech.SpeechClient()
 
 # 임시 디렉토리 설정
 TEMP_DIR = "tmp/directly"
 if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
+
+
+def get_max_ES_id():
+    response = es.search(index=VIDEO_INDEX, 
+        body={
+            "size": 1,
+            "sort": {
+                "_id": {
+                    "order": "desc"
+                }
+            },
+            "_source": False
+        }
+    )
+    largest_id = response['hits']['hits'][0]['_id'] if response['hits']['hits'] else None
+    numeric_id = int(re.search(r'\d+', largest_id).group()) if largest_id is not None and re.search(r'\d+', largest_id) else 0
+
+    return numeric_id
+
+es_id = get_max_ES_id() + 1
 
 """
 { 
@@ -86,7 +109,9 @@ def VIDEO_add_document(title: str,              # Required
                     category: str,        # Required
                     is_youtube: bool,     # Required
                     video_url: str,       # Required
-                    keywords: list[str]): # Optional
+                    keywords: list[str],
+                    likes: int = 0,
+                    views: int = 0): # Optional
     if title is None or category is None or video_url is None:
         return 400, "Invalid" # title, category, video_url **Required**
     
@@ -94,7 +119,6 @@ def VIDEO_add_document(title: str,              # Required
     # created_at, likes, views, keywords: list
     current_time = datetime.now()
     created_at = current_time.strftime("%Y-%m-%d %H:%M:%S")
-    likes, views = 0, 0
     data = json.dumps({
         "title": title,
         "description": description,
@@ -306,15 +330,42 @@ def merge_transcripts(audio_files):
 
     return all_results
 
-def increase_view():
-    return
-
+def increase_view(doc_id):
+    try:
+        response = es.update(
+            index=VIDEO_INDEX,
+            id=doc_id,
+            body = {
+                "script": {
+                    "source": f"ctx._source.views += 1",
+                    "lang": "painless"
+                }
+            }
+        )
+        logger.info(f"'View' Field in document {doc_id} incrementated successfully")
+        return response
+    except exceptions.NotFoundError:
+        print(f"Document with ID {doc_id} not found in index {VIDEO_INDEX}.")
+        return None
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        return None
+        
+        
+        
 def upload_video_elastic_save(data, scripts):
     if not data:
         return jsonify({ "error": "JSON body required." }), 400
     
+    if data.get('is_youtube'):
+        youtube_info = get_youtube_video_stats(data.get('video_url'))
+        views = youtube_info['views']
+        likes = youtube_info['likes']
+    else:
+        views, likes = 0, 0
+    
     status_code, msg = VIDEO_add_document(data.get('title'), data.get('description'), data.get('owner'), data.get('password'),
-                data.get('is_open'), data.get('category'), data.get('is_youtube'), data.get('video_url'), data.get('keywords'))
+                data.get('is_open'), data.get('category'), data.get('is_youtube'), data.get('video_url'), data.get('keywords'), likes, views)
 
     if status_code == 400:
         return jsonify({"error": "title, category, video_url Required"}), 400
@@ -339,27 +390,68 @@ def upload_video_elastic_save(data, scripts):
     else:
         return jsonify({"error": str(msg)}), 500
 
+def get_document(doc_id):
+    try:
+        res = es.get(index=VIDEO_INDEX, id=doc_id)
+        return res["_source"]
+    except exceptions.NotFoundError:
+        return 404 # Document not found
+    
+def get_youtube_video_stats(video_url):
+    # Extract the video ID from the URL
+    if "v=" in video_url:
+        video_id = video_url.split("v=")[1].split("&")[0]
+    else:
+        raise ValueError("Invalid YouTube URL")
 
+    # Build the YouTube service
+    youtube = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=API_KEY)
 
+    # Call the YouTube Data API to get video details
+    request = youtube.videos().list(
+        part="statistics",
+        id=video_id
+    )
+    response = request.execute()
 
-
-
+    # Parse the response for statistics
+    if "items" in response and len(response["items"]) > 0:
+        stats = response["items"][0]["statistics"]
+        views = stats.get("viewCount", "N/A")
+        likes = stats.get("likeCount", "N/A")
+        return {
+            "views": int(views) if views != "N/A" else 0,
+            "likes": int(likes) if likes != "N/A" else 0,
+        }
+    else:
+        raise ValueError("Video not found or inaccessible")
 
 ################################################################################
 
 # MP4 파일 스트리밍 요청
-@app.route("/video/<filename>", methods=["GET"])
-def get_video(filename):
-    
-    try:
-        url = s3_client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": S3_BUCKET_NAME, "Key": filename},
-            ExpiresIn=3600,
-        )
-        return jsonify({"presignedUrl": url})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/video/<doc_id>", methods=["GET"])
+def get_video(doc_id):
+    msg = get_document(doc_id)
+    # 조회수 올리기
+    inc_view_res = increase_view(doc_id)
+    if msg == 404:
+        return jsonify({"error": "Document not found"})
+    elif isinstance(msg, dict) and msg:
+        # youtube 영상이 아니면 S3 객체에 대해 presigned url 생성해서 리턴
+        if (not msg['is_youtube']):
+            try:
+                url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": S3_BUCKET_NAME, "Key": msg['video_url']},
+                    ExpiresIn=3600,
+                )
+                return jsonify({"presignedUrl": url}), 200
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        # youtube 영상이면 클라이언트 쪽에서 Youtube API 사용하도록
+        else:
+            return jsonify({"youtube": "it's youtube url"}), 200
+    return jsonify({ "error": "Unexpected document format"}), 500
     
 # 직접 업로드 처리
 @app.route("/upload/file", methods=["POST"])
