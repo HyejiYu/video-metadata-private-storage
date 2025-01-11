@@ -1,6 +1,6 @@
 .env
 fsp-gcp-project-key.json
 data
-app.json
+app.js
 package.json
 package-lock.json
