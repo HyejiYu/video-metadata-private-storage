@@ -330,6 +330,14 @@ def merge_transcripts(audio_files):
 
     return all_results
 
+def convert_to_full_datetime(date_str):
+    try:
+        # 'yyyy-MM-dd' 형식의 날짜를 받아서 'yyyy-MM-dd HH:mm:ss' 형식으로 변환
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        return date_obj.strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return 'Invalid date format'
+
 def increase_view(doc_id):
     try:
         response = es.update(
@@ -741,8 +749,11 @@ def search():
         info_result += [
             {
                 "id": single_res['id'],
+                "score": single_res['score'],
                 "title": msg['title'],
                 "description": msg['description'],
+                "category": msg['category'],
+                "keywords": msg['keywords'],
                 "created_at": msg['created_at'],
                 "views": msg['views'],
                 "likes": msg['likes']
@@ -750,7 +761,152 @@ def search():
         ]
     
     return jsonify(info_result), 200
-        
+
+@app.route('/search/detail', methods=['GET'])
+def search_detail():
+    """ 
+        curl -X GET "http://localhost:3000/search/detail?category=fullstack&keywords=dart,flutter,javascript&..."  
+        - category  : fullstack
+        - keywords  : dart,flutter,javascript
+        - created_at: 2024-01-01,2024-12-31
+        - likes     : 0
+        - views     : 0
+        - is_script : 1, XXX
+        - query     : flutter XXX
+    """
+    category = request.args.get('category')
+    keywords = request.args.get('keywords', '')
+    if keywords:
+        keywords_list = keywords.split(',')
+    else:
+        keywords_list = []
+    
+    created_at = request.args.get('created_at')
+    if created_at:
+        try:
+            created_at_list = created_at.split(',')
+            created_at_start = convert_to_full_datetime(created_at_list[0])
+            created_at_end = convert_to_full_datetime(created_at_list[1])
+            
+        except ValueError:
+            return 'Invalid date format'
+    else:
+        created_at_start = convert_to_full_datetime('2024-01-01')
+        created_at_end = convert_to_full_datetime(str(datetime.now())[:10])
+    
+    likes = int(request.args.get('likes', 0))
+    views = int(request.args.get('views', 0))
+    # is_script = request.args.get('is_script', 1)
+    # query = request.args.get('query', '')
+    
+    # Elasticsearch 쿼리 빌드
+    must_queries = []
+    
+    # category는 완전히 일치하는 데이터만
+    if category:
+        must_queries.append({
+            'term': {'category.keyword': category}  # exact match using keyword field
+        })
+    
+    # keywords는 모든 값들을 OR 연산해서
+    if keywords:
+        must_queries.append({
+            'bool': {
+                'should': [{'match': {'keywords': keyword}} for keyword in keywords_list],
+                'minimum_should_match': 1 
+            }
+        })
+    
+    # created_at은 날짜 범위 조건
+    if created_at_start and created_at_end:
+        must_queries.append({
+            'range': {
+                'created_at': {
+                    'gte': created_at_start,
+                    'lte': created_at_end,
+                    'format': 'yyyy-MM-dd'  # 날짜 형식 지정
+                }
+            }
+        })
+
+    if likes > 0:
+        must_queries.append({
+            'range': {'likes': {'gte': likes}}
+        })
+    if views > 0:
+        must_queries.append({
+            'range': {'views': {'gte': views}}
+        })
+
+    # 최종 Elasticsearch 쿼리 구성
+    search_body = {
+        'query': {
+            'bool': {
+                'must': must_queries
+            }
+        }
+    }
+    
+    print(f"search_body: \n{search_body}")
+    
+    try:
+        response = es.search(index=VIDEO_INDEX, body=search_body)
+    except exceptions.ConnectionError:
+        return jsonify({'error': 'Failed to connect to Elasticsearch'}), 500
+    except exceptions.RequestError as e:
+        return jsonify({'error': f'Elasticsearch query error: {str(e)}'}), 400
+
+    all_results = []
+    if response['hits']['hits']:
+        for doc in response['hits']['hits']:
+            all_results.append({
+                "id": doc['_id'],
+                "score": doc['_score'],
+                "title": doc['_source']['title'],
+                "description": doc['_source']['description'],
+                "category": doc['_source']['category'],
+                "keywords": doc['_source']['keywords'],
+                "created_at": doc['_source']['created_at'],
+                "views": doc['_source']['views'],
+                "likes": doc['_source']['likes']
+            })
+        return jsonify(all_results)
+    else:
+        return jsonify({'message': 'No results found'}), 404
+
+@app.route("/get_all", methods=['GET'])
+def get_all_video():
+    body = {
+        'query': {
+            'match_all': {}
+        },
+        'size': 15
+    }
+    
+    try:
+        response = es.search(index=VIDEO_INDEX, body=body)
+    except exceptions.ConnectionError:
+        return jsonify({'error': 'Failed to connect to Elasticsearch'}), 500
+    except exceptions.RequestError as e:
+        return jsonify({'error': f'Elasticsearch query error: {str(e)}'}), 400
+    
+    all_results = []
+    if response['hits']['hits']:
+        for doc in response['hits']['hits']:
+            all_results.append({
+                "id": doc['_id'],
+                "title": doc['_source']['title'],
+                "description": doc['_source']['description'],
+                "category": doc['_source']['category'],
+                "keywords": doc['_source']['keywords'],
+                "created_at": doc['_source']['created_at'],
+                "views": doc['_source']['views'],
+                "likes": doc['_source']['likes']
+            })
+        return jsonify(all_results)
+    else:
+        return jsonify({'message': 'No results found'}), 404
+
 
 # 서버 실행
 if __name__ == "__main__":
