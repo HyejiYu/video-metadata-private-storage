@@ -5,13 +5,19 @@ import boto3
 import subprocess
 import yt_dlp
 import time, uuid
-from google.cloud import speech
+from google.cloud import speech, storage
 from google.cloud import speech_v1p1beta1 as speech
 from pydub import AudioSegment
 from datetime import timedelta, datetime
 from elasticsearch import Elasticsearch, exceptions
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
+from moviepy import VideoFileClip
+from flask_cors import CORS
+import requests
+from requests.auth import HTTPBasicAuth
+
+
 
 
 logging.basicConfig(
@@ -41,6 +47,7 @@ YOUTUBE_API_VERSION = 'v3'
 app = Flask(__name__)
 # 요청 크기 제한을 300MB로 설정
 app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024 
+CORS(app)
 
 # ElasticSearch
 es = Elasticsearch(
@@ -60,11 +67,32 @@ s3_client = boto3.client(
 # Google Cloud Speech-to-Text 클라이언트 초기화
 speech_client = speech.SpeechClient()
 
+THUMBNAIL_DIR = 'tmp/thumbnail'
+if not os.path.exists(THUMBNAIL_DIR):
+    os.makedirs(THUMBNAIL_DIR)
+
 # 임시 디렉토리 설정
 TEMP_DIR = "tmp/directly"
 if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
 
+
+def save_thumbnail_into_GCS(source_file_name, blob_name, bucket_name='fsp-private-video-metadata-storage'):
+    """Write and read a blob from GCS using file-like IO"""
+    # The ID of your GCS bucket
+    # bucket_name = "your-bucket-name"
+
+    # The ID of your new GCS object
+    # blob_name = "storage-object-name"
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name) # GCS에 이미지 저장 시 저장될 이름
+    
+    blob.upload_from_filename(source_file_name)
+    logger.info("Saved video thumbnail in GCS")
+    
+    return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
 
 def get_max_ES_id():
     response = es.search(index=VIDEO_INDEX, 
@@ -110,8 +138,9 @@ def VIDEO_add_document(title: str,              # Required
                     is_youtube: bool,     # Required
                     video_url: str,       # Required
                     keywords: list[str],
-                    likes: int = 0,
-                    views: int = 0): # Optional
+                    likes: int,
+                    views: int,
+                    thumbnail_url: str): # Optional
     if title is None or category is None or video_url is None:
         return 400, "Invalid" # title, category, video_url **Required**
     
@@ -131,6 +160,7 @@ def VIDEO_add_document(title: str,              # Required
         "views": views,
         "is_youtube": is_youtube,
         "video_url": video_url,
+        "thumbnail_url": thumbnail_url,
         "keywords": keywords
     })
     try:
@@ -224,6 +254,7 @@ def transcribe_with_timestamps(audio_path):
     client = speech.SpeechClient()
 
     audio_bytes_list = split_audio_and_generate_bytes(audio_path)
+    audio_len = len(audio_bytes_list)
     result_data = []
     for i, audio_bytes in enumerate(audio_bytes_list):
         
@@ -236,8 +267,9 @@ def transcribe_with_timestamps(audio_path):
             "enable_word_time_offsets": True
         }
 
+        
         response = client.recognize(config=config, audio=audio)
-        logger.info("Waiting for TRANSCRIBING AUDIO to text...")
+        logger.info(f"Waiting for TRANSCRIBING AUDIO to text... ({i+1}/{audio_len})")
 
         
         for result in response.results:
@@ -358,10 +390,41 @@ def increase_view(doc_id):
     except Exception as e:
         print(f"Error occurred: {e}")
         return None
+    
+def increase_likes(doc_id):
+    try:
+        response = es.update(
+            index=VIDEO_INDEX,
+            id=doc_id,
+            body = {
+                "script": {
+                    "source": f"ctx._source.likes += 1",
+                    "lang": "painless"
+                }
+            }
+        )
+        logger.info(f"'likes' Field in document {doc_id} incrementated successfully")
+        return response
+    except exceptions.NotFoundError:
+        print(f"Document with ID {doc_id} not found in index {VIDEO_INDEX}.")
+        return None
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        return None
         
+def generate_thumbnail(video_path, filename):
+    # moviepy로 동영상 처리
+    with VideoFileClip(video_path) as video:
+        # 동영상 길이의 중간 지점에서 썸네일 추출
+        thumbnail_time = video.duration / 2
+        thumbnail_path = os.path.join(THUMBNAIL_DIR, f"{os.path.splitext(filename)[0]}.png")
+
+        # 썸네일 저장
+        video.save_frame(thumbnail_path, t=thumbnail_time)
+
+    return thumbnail_path
         
-        
-def upload_video_elastic_save(data, scripts):
+def upload_video_elastic_save(data, scripts, video_path=''):
     if not data:
         return jsonify({ "error": "JSON body required." }), 400
     
@@ -369,11 +432,16 @@ def upload_video_elastic_save(data, scripts):
         youtube_info = get_youtube_video_stats(data.get('video_url'))
         views = youtube_info['views']
         likes = youtube_info['likes']
+        video_id = youtube_info['video_id']
+        thumbnail_url = f"https://img.youtube.com/vi/{video_id}/0.jpg"
     else:
         views, likes = 0, 0
+        
+        image_path = generate_thumbnail(video_path, f"{data.get('title')}_thumbnail")
+        thumbnail_url = save_thumbnail_into_GCS(image_path, f"{data.get('title')}_thumbnail.png")
     
     status_code, msg = VIDEO_add_document(data.get('title'), data.get('description'), data.get('owner'), data.get('password'),
-                data.get('is_open'), data.get('category'), data.get('is_youtube'), data.get('video_url'), data.get('keywords'), likes, views)
+                data.get('is_open'), data.get('category'), data.get('is_youtube'), data.get('video_url'), data.get('keywords'), likes, views, thumbnail_url)
 
     if status_code == 400:
         return jsonify({"error": "title, category, video_url Required"}), 400
@@ -383,6 +451,7 @@ def upload_video_elastic_save(data, scripts):
         if status_code == 200:
             increase_es_id()
             return jsonify({
+                "completed_at": datetime.now(),
                 "message": "Text Transcription and ES Saving Completed Successfully.",
                 "VIDEO _id": msg['_id'],
                 "VIDEO_SCRIPT _id": script_msg['_id'],
@@ -438,6 +507,7 @@ def get_youtube_video_stats(video_url):
         return {
             "views": int(views) if views != "N/A" else 0,
             "likes": int(likes) if likes != "N/A" else 0,
+            "video_id": video_id
         }
     else:
         raise ValueError("Video not found or inaccessible")
@@ -445,10 +515,155 @@ def get_youtube_video_stats(video_url):
 
 ################################################################################
 
+@app.route("/monitor/view_rank")
+def view_rank():
+    index_name = VIDEO_INDEX  # Elasticsearch 인덱스 이름
+    
+    try:
+        # 쿼리 작성
+        youtube_query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"is_youtube": True}}
+                    ]
+                }
+            },
+            "sort": [
+                {"views": {"order": "desc"}}
+            ],
+            "size": 10
+        }
+
+        non_youtube_query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"is_youtube": False}}
+                    ]
+                }
+            },
+            "sort": [
+                {"views": {"order": "desc"}}
+            ],
+            "size": 10
+        }
+
+        # Elasticsearch에서 데이터 조회
+        youtube_response = es.search(index=index_name, body=youtube_query)
+        non_youtube_response = es.search(index=index_name, body=non_youtube_query)
+
+        # 결과 정리
+        youtube_videos = [
+            {
+                "title": doc["_source"].get("title"),
+                "views": doc["_source"].get("views"),
+                "id": doc['_id'],
+                "is_youtube": doc["_source"].get("is_youtube")
+            }
+            for doc in youtube_response["hits"]["hits"]
+        ]
+
+        non_youtube_videos = [
+            {
+                "title": doc["_source"].get("title"),
+                "views": doc["_source"].get("views"),
+                "id": doc['_id'],
+                "is_youtube": doc["_source"].get("is_youtube")
+            }
+            for doc in non_youtube_response["hits"]["hits"]
+        ]
+
+        return jsonify({
+            "youtube_videos": youtube_videos,
+            "non_youtube_videos": non_youtube_videos
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
+@app.route("/monitor/category_ratio", methods=['GET'])
+def category_ratio():
+    try:
+        # Elasticsearch 검색 쿼리
+        query = {
+            "size": 0,
+            "aggs": {
+                "keyword_count": {
+                    "terms": {
+                        "field": "category",
+                        "size": 10
+                    }
+                },
+                "total_count": {
+                    "value_count": {
+                        "field": "_id"
+                    }
+                }
+            }
+        }
+
+        # Elasticsearch에 요청
+        response = requests.post(
+            f"http://localhost:9200/{VIDEO_INDEX}/_search",
+            json=query,
+            headers={"Content-Type": "application/json"},
+            auth=HTTPBasicAuth(ELASTIC_USER, ELASTIC_PASSWORD)
+        )
+
+        # 응답 처리
+        if response.status_code == 200:
+            es_data = response.json()
+            total_docs = es_data['aggregations']['total_count']['value']
+            buckets = es_data['aggregations']['keyword_count']['buckets']
+
+            # 비율 계산 및 데이터 포맷 변환
+            results = [
+                {
+                    "keyword": bucket["key"],
+                    "count": bucket["doc_count"],
+                    "ratio": round((bucket["doc_count"] / total_docs) * 100, 2)
+                }
+                for bucket in buckets
+            ]
+
+            return jsonify({
+                "total_docs": total_docs,
+                "results": results
+            }), 200
+        else:
+            return jsonify({
+                "error": "Failed to fetch data from Elasticsearch",
+                "status_code": response.status_code,
+                "details": response.text
+            }), response.status_code
+
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error occurred: {str(e)}"}), 500
+
+@app.route("/likes", methods=["POST"])
+def press_like():
+    try:
+        # logger.info(f"\n\n\nlikes!!!!!!!!!!!!!!!!!!!!!!!!!")
+        data = request.get_json()
+        doc_id = data.get("doc_id")
+        
+        if not doc_id:
+            return jsonify({"error": "doc_id is required"}), 400
+        logger.info(f"Increment likes Completed.")
+        increase_likes(doc_id)
+        
+        return jsonify({ "Success": "Increment likes" }), 200
+    except Exception as e:
+        return jsonify({ "error": "Unexpected Error" }), 500
+
+
 # MP4 파일 스트리밍 요청
 @app.route("/video", methods=["GET"])
 def get_video():
     doc_id = request.args.get("doc_id")
+    # logger.info(f"Received doc_id: {doc_id}")
     video_msg = get_VIDEO_document(doc_id)
     script_msg = get_VIDEO_SCRIPT_document(doc_id)
     # 조회수 올리기
@@ -457,16 +672,37 @@ def get_video():
     elif isinstance(video_msg, dict) and video_msg:
         inc_view_res = increase_view(doc_id)
         # youtube 영상이 아니면 S3 객체에 대해 presigned url 생성해서 리턴
-        if (not video_msg['is_youtube']):
+        if (video_msg['video_url'].startswith('https://')):
+            try:
+                logger.info(f"it's youtube video!!!\n    Response: {video_msg}")
+                return jsonify(
+                    {
+                        "is_youtube": 1,
+                        "id": doc_id,
+                        "title": video_msg['title'],
+                        "description": video_msg['description'],
+                        "created_at": video_msg['created_at'],
+                        "video_url": video_msg['video_url'],
+                        "views": video_msg['views'],
+                        "likes": video_msg['likes'],
+                        "scripts": script_msg['scripts']
+                    }), 200
+            
+                
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        else:
             try:
                 url = s3_client.generate_presigned_url(
                     "get_object",
-                    Params={"Bucket": S3_BUCKET_NAME, "Key": video_msg['video_url']},
+                    Params={"Bucket": S3_BUCKET_NAME, "Key": f"{video_msg['title']}.mp4"},
                     ExpiresIn=3600,
                 )
+                # print(f"\nPresignedUrl: {url}")
                 return jsonify(
                     {
                         "is_youtube": 0,
+                        "id": doc_id,
                         "title": video_msg['title'],
                         "description": video_msg['description'],
                         "created_at": video_msg['created_at'],
@@ -477,18 +713,6 @@ def get_video():
                     }), 200
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
-        # youtube 영상이면 클라이언트 쪽에서 Youtube API 사용하도록
-        else:
-            return jsonify(
-                {
-                    "is_youtube": 1,
-                    "title": video_msg['title'],
-                    "description": video_msg['description'],
-                    "created_at": video_msg['created_at'],
-                    "views": video_msg['views'],
-                    "likes": video_msg['likes'],
-                    "scripts": script_msg['scripts']
-                }), 200
     return jsonify({ "error": "Unexpected document format"}), 500
     
 # 직접 업로드 처리
@@ -511,7 +735,7 @@ def upload_file():
         
         # S3에 업로드
         logger.info("Uploading file to S3...")
-        upload_to_s3(local_path, S3_BUCKET_NAME, filename)
+        upload_to_s3(local_path, S3_BUCKET_NAME, f"{json.loads(request.form['data']).get('title')}.mp4")
 
         # 오디오 추출
         logger.info("Extracting audio from video...")
@@ -536,7 +760,7 @@ def upload_file():
             json_data = json.loads(request.form['data'])
         except json.JSONDecodeError:
             return jsonify({ "error": "Invalid JSON format" }), 400
-        return upload_video_elastic_save(json_data, grouped_segments)
+        return upload_video_elastic_save(json_data, grouped_segments, local_path)
 
     except FileNotFoundError as e:
         logger.error(f"File not found: {e}")
@@ -571,6 +795,7 @@ def upload_youtube():
     }
     if "data" not in request.form:
         return jsonify({"error": "JSON data is required."}), 400
+    print(f"\nRequest.form: {request.form}")
     
     try:
         json_data = json.loads(request.form['data'])
@@ -671,7 +896,7 @@ def match_VIDEO_keywords(word):
                 "minimum_should_match": "1"
             }
         },
-        "size": 10
+        "size": 30
     }
     try:
         response = es.search(index=VIDEO_INDEX, body=body)
@@ -725,42 +950,47 @@ def search():
         curl -X GET "http://localhost:3000/search?query=news%20forest"  
     """
     query = request.args.get('query')
-    words = query.split(" ")
-    
-    all_results = []
-    for word in words:
-        video_res = match_VIDEO_keywords(word)
-        video_script_res = match_VIDEO_SCRIPT_keywords(word)
+    if query:
+        words = query.split(" ")
         
-        # if not video_res and not video_script_res:
-        #     return jsonify({ "message": "No results found" }), 404
-        all_results += ( video_res + video_script_res )
-        # print(f"word: {word}\n  video_res: {video_res}\n  video_script_res: {video_script_res}")
+        all_results = []
+        for word in words:
+            video_res = match_VIDEO_keywords(word)
+            video_script_res = match_VIDEO_SCRIPT_keywords(word)
+            
+            # if not video_res and not video_script_res:
+            #     return jsonify({ "message": "No results found" }), 404
+            all_results += ( video_res + video_script_res )
+            # print(f"word: {word}\n  video_res: {video_res}\n  video_script_res: {video_script_res}")
+            
+        if not all_results:
+            return jsonify({ "message": "No results found" }), 404
         
-    if not all_results:
-        return jsonify({ "message": "No results found" }), 404
-    
-    unique_results = {result['id']: result for result in all_results}.values()
-    print(unique_results)
-    
-    info_result = []
-    for single_res in unique_results:
-        msg = get_VIDEO_document(single_res['id'])
-        info_result += [
-            {
-                "id": single_res['id'],
-                "score": single_res['score'],
-                "title": msg['title'],
-                "description": msg['description'],
-                "category": msg['category'],
-                "keywords": msg['keywords'],
-                "created_at": msg['created_at'],
-                "views": msg['views'],
-                "likes": msg['likes']
-            }
-        ]
-    
-    return jsonify(info_result), 200
+        unique_results = {result['id']: result for result in all_results}.values()
+        print(unique_results)
+        
+        info_result = []
+        for single_res in unique_results:
+            msg = get_VIDEO_document(single_res['id'])
+            info_result += [
+                {
+                    "id": single_res['id'],
+                    "score": single_res['score'],
+                    "title": msg['title'],
+                    "description": msg['description'],
+                    "category": msg['category'],
+                    "keywords": msg['keywords'],
+                    "created_at": msg['created_at'],
+                    "is_youtube": msg['is_youtube'],
+                    "views": msg['views'],
+                    "likes": msg['likes'],
+                    "thumbnail_url": msg['thumbnail_url']
+                }
+            ]
+        return jsonify(info_result), 200
+    else:
+        return get_all_video()
+        
 
 @app.route('/search/detail', methods=['GET'])
 def search_detail():
@@ -785,72 +1015,80 @@ def search_detail():
     if created_at:
         try:
             created_at_list = created_at.split(',')
-            created_at_start = convert_to_full_datetime(created_at_list[0])
-            created_at_end = convert_to_full_datetime(created_at_list[1])
+            # created_at_start = convert_to_full_datetime(created_at_list[0])
+            # created_at_end = convert_to_full_datetime(created_at_list[1])
+            created_at_start = created_at_list[0]
+            created_at_end = created_at_list[1]
             
         except ValueError:
             return 'Invalid date format'
     else:
-        created_at_start = convert_to_full_datetime('2024-01-01')
-        created_at_end = convert_to_full_datetime(str(datetime.now())[:10])
+        # created_at_start = convert_to_full_datetime('2024-01-01')
+        # created_at_end = convert_to_full_datetime(str(datetime.now())[:10])
+        created_at_start = '2024-01-01'
+        created_at_end = str(datetime.now())[:10]
     
     likes = int(request.args.get('likes', 0))
     views = int(request.args.get('views', 0))
     # is_script = request.args.get('is_script', 1)
     # query = request.args.get('query', '')
     
-    # Elasticsearch 쿼리 빌드
-    must_queries = []
+    print(f"\ncategory: {category}\n  keyword: {keywords}\n  created_at_start: {created_at_start}\n  created_at_end: {created_at_end}\n  likes: {likes}\n  views: {views}")
     
-    # category는 완전히 일치하는 데이터만
-    if category:
-        must_queries.append({
-            'term': {'category.keyword': category}  # exact match using keyword field
-        })
+    keyword_query = " ".join(keywords)
     
-    # keywords는 모든 값들을 OR 연산해서
-    if keywords:
-        must_queries.append({
-            'bool': {
-                'should': [{'match': {'keywords': keyword}} for keyword in keywords_list],
-                'minimum_should_match': 1 
+    # Elasticsearch 쿼리 생성
+    query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "range": {
+                            "created_at": {
+                                "gte": created_at_start,
+                                "lte": created_at_end
+                            }
+                        }
+                    },
+                    {
+                        "range": {
+                            "likes": {
+                                "gte": likes
+                            }
+                        }
+                    },
+                    {
+                        "range": {
+                            "views": {
+                                "gte": views
+                            }
+                        }
+                    }
+                ],
+                "should": [
+                    {
+                        "multi_match": {
+                            "query": keyword_query,
+                            "fields": ["keywords^3", "description^2", "title"],
+                            "operator": "or"
+                        }
+                    }
+                ],
+                "minimum_should_match": 1
             }
-        })
-    
-    # created_at은 날짜 범위 조건
-    if created_at_start and created_at_end:
-        must_queries.append({
-            'range': {
-                'created_at': {
-                    'gte': created_at_start,
-                    'lte': created_at_end,
-                    'format': 'yyyy-MM-dd'  # 날짜 형식 지정
-                }
+        },
+        "sort": [
+            {
+                "_score": "desc"
             }
-        })
-
-    if likes > 0:
-        must_queries.append({
-            'range': {'likes': {'gte': likes}}
-        })
-    if views > 0:
-        must_queries.append({
-            'range': {'views': {'gte': views}}
-        })
-
-    # 최종 Elasticsearch 쿼리 구성
-    search_body = {
-        'query': {
-            'bool': {
-                'must': must_queries
-            }
-        }
+        ],
+        "size": 35
     }
     
-    print(f"search_body: \n{search_body}")
+    print(f"search_body: \n{query}")
     
     try:
-        response = es.search(index=VIDEO_INDEX, body=search_body)
+        response = es.search(index=VIDEO_INDEX, body=query)
     except exceptions.ConnectionError:
         return jsonify({'error': 'Failed to connect to Elasticsearch'}), 500
     except exceptions.RequestError as e:
@@ -867,8 +1105,10 @@ def search_detail():
                 "category": doc['_source']['category'],
                 "keywords": doc['_source']['keywords'],
                 "created_at": doc['_source']['created_at'],
+                "is_youtube": doc['_source']['is_youtube'],
                 "views": doc['_source']['views'],
-                "likes": doc['_source']['likes']
+                "likes": doc['_source']['likes'],
+                "thumbnail_url": doc['_source']['thumbnail_url']
             })
         return jsonify(all_results)
     else:
@@ -880,7 +1120,7 @@ def get_all_video():
         'query': {
             'match_all': {}
         },
-        'size': 15
+        'size': 30
     }
     
     try:
@@ -900,9 +1140,12 @@ def get_all_video():
                 "category": doc['_source']['category'],
                 "keywords": doc['_source']['keywords'],
                 "created_at": doc['_source']['created_at'],
+                "is_youtube": doc['_source']['is_youtube'],
                 "views": doc['_source']['views'],
-                "likes": doc['_source']['likes']
+                "likes": doc['_source']['likes'],
+                "thumbnail_url": doc['_source']['thumbnail_url']
             })
+            # print(doc['_source'])
         return jsonify(all_results)
     else:
         return jsonify({'message': 'No results found'}), 404
